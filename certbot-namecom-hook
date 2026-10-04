@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Standalone Name.com DNS-01 hooks for Certbot (Python 3 standard library)."""
+
+import argparse
+import base64
+import configparser
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+API_URL = "https://api.name.com/core/v1"
+
+
+class Error(Exception):
+    pass
+
+
+def normalize_name(name):
+    return name.rstrip(".").lower()
+
+
+def load_account(path, name):
+    config = configparser.ConfigParser(interpolation=None)
+    try:
+        with open(path, encoding="utf-8") as stream:
+            config.read_file(stream)
+    except OSError:
+        raise Error(f"Cannot read configuration: {path}") from None
+    except (configparser.Error, UnicodeError):
+        # ConfigParser errors can contain source lines, including credentials.
+        raise Error(f"Invalid INI configuration: {path}") from None
+
+    matches = [
+        (normalize_name(section), section) for section in config.sections()
+        if normalize_name(section)
+        and (name == normalize_name(section)
+             or name.endswith("." + normalize_name(section)))
+    ]
+    if not matches:
+        raise Error(f"No configured domain matches {name}")
+    domain, section = max(matches, key=lambda item: len(item[0]))
+    username = config.get(section, "username", fallback="").strip()
+    token = config.get(section, "token", fallback="").strip()
+    if not username or not token:
+        raise Error(f"Configuration [{section}] requires username and token")
+    return domain, username, token
+
+
+def api_request(domain, username, token, payload=None, record_id=None):
+    url = f"{API_URL}/domains/{urllib.parse.quote(domain, safe='')}/records"
+    credentials = base64.b64encode(f"{username}:{token}".encode()).decode("ascii")
+    headers = {"Authorization": f"Basic {credentials}", "Accept": "application/json"}
+    body = None
+    method = "DELETE" if record_id is not None else "POST"
+    if record_id is not None:
+        url += f"/{record_id}"
+    else:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return True if method == "DELETE" else json.load(response)
+    except urllib.error.HTTPError as exc:
+        if method == "DELETE" and exc.code == 404:
+            return False
+        raise Error(f"Name.com API returned HTTP {exc.code}") from None
+    except (urllib.error.URLError, OSError):
+        raise Error("Name.com request failed (network error or timeout)") from None
+    except (ValueError, UnicodeError):
+        raise Error("Name.com API returned invalid JSON") from None
+
+
+def challenge_name():
+    identifier = os.environ.get("CERTBOT_IDENTIFIER") or os.environ.get("CERTBOT_DOMAIN")
+    if not identifier:
+        raise Error("Missing CERTBOT_IDENTIFIER or CERTBOT_DOMAIN")
+    identifier = normalize_name(identifier)
+    if identifier.startswith("*."):
+        identifier = identifier[2:]
+    if not identifier:
+        raise Error("Empty challenge domain")
+    return "_acme-challenge." + identifier
+
+
+def auth(config, wait):
+    name = challenge_name()
+    value = os.environ.get("CERTBOT_VALIDATION")
+    if not value:
+        raise Error("Missing CERTBOT_VALIDATION")
+    domain, username, token = load_account(config, name)
+    host = "" if name == domain else name[:-(len(domain) + 1)]
+    response = api_request(domain, username, token, {
+        "host": host, "type": "TXT", "answer": value, "ttl": 300,
+    })
+    record_id = response.get("id") if isinstance(response, dict) else None
+    if type(record_id) is not int or record_id <= 0:
+        raise Error("Name.com API returned no valid record ID; check DNS for an orphaned TXT record")
+    # Certbot passes this stdout back to the corresponding cleanup invocation.
+    # Flush before waiting so cleanup information is not held in a buffer.
+    print(json.dumps({"domain": domain, "name": name, "id": record_id}), flush=True)
+    if wait:
+        time.sleep(wait)
+
+
+def cleanup(config):
+    output = os.environ.get("CERTBOT_AUTH_OUTPUT", "").strip()
+    if not output:
+        return
+    try:
+        state = json.loads(output)
+        domain, name, record_id = state["domain"], state["name"], state["id"]
+        if not isinstance(domain, str) or not domain or not isinstance(name, str):
+            raise ValueError
+        if type(record_id) is not int or record_id <= 0:
+            raise ValueError
+    except (ValueError, KeyError, TypeError):
+        raise Error("Invalid CERTBOT_AUTH_OUTPUT") from None
+    if name != challenge_name():
+        raise Error("Auth output does not match the current challenge domain")
+    configured_domain, username, token = load_account(config, name)
+    if domain != configured_domain:
+        raise Error("Auth output domain does not match the configured domain")
+    api_request(domain, username, token, record_id=record_id)
+
+
+def parse_wait(value):
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Wait must be a non-negative integer") from None
+    if seconds < 0:
+        raise argparse.ArgumentTypeError("Wait must be a non-negative integer")
+    return seconds
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="/etc/namecom.ini", metavar="PATH",
+                        help="INI configuration (default: /etc/namecom.ini)")
+    commands = parser.add_subparsers(dest="command", required=True)
+    auth_parser = commands.add_parser("auth", help="Create the challenge TXT record and wait")
+    cleanup_parser = commands.add_parser("cleanup", help="Delete only the record created by auth")
+    for command in (auth_parser, cleanup_parser):
+        command.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
+                             help="INI configuration (default: /etc/namecom.ini)")
+    auth_parser.add_argument("--wait", type=parse_wait, default=25, metavar="SECONDS",
+                             help="Propagation wait per challenge (default: 25; 0 disables waiting)")
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "auth":
+            auth(args.config, args.wait)
+        else:
+            cleanup(args.config)
+    except Error as exc:
+        print(f"certbot-namecom-hook: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
