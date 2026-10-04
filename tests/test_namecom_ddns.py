@@ -39,7 +39,7 @@ class DDNSTests(unittest.TestCase):
             self.assertEqual(request.get_method(), method)
             self.assertEqual(json.loads(request.data), dict(host='x', type='A', answer='5.6.7.8', ttl=ttl))
             self.assertIn('-4', curl.call_args.args[0])
-            self.assertIn('https://ifconfig.co/ip', curl.call_args.args[0])
+            self.assertIn('https://api.ip.sb/ip', curl.call_args.args[0])
             sleep.assert_not_called()
 
     def test_duplicates_removed_even_if_first_matches(self):
@@ -72,11 +72,15 @@ class DDNSTests(unittest.TestCase):
             for service, body, url in [
                 ('ifconfig.co', '5.6.7.8\n', 'https://ifconfig.co/ip'),
                 ('ipify.org', '5.6.7.8', 'https://api.ipify.org'),
+                ('ip.sb', '5.6.7.8\n', 'https://api.ip.sb/ip'),
                 ('cip.cc', 'IP\t: 5.6.7.8\n地址\t: test\nURL\t: http://www.cip.cc/5.6.7.8\n', 'https://www.cip.cc'),
             ]:
                 code, _, _, api, curl, _ = self.invoke([{}, {}], [body], extra=[option, service])
                 self.assertEqual(code, 0)
                 self.assertEqual(curl.call_args.args[0][-1], url)
+                if service == 'ip.sb':
+                    args = curl.call_args.args[0]
+                    self.assertEqual(args[args.index('--user-agent') + 1], 'namecom-ddns')
                 self.assertEqual(json.loads(api.call_args.args[0].data)['answer'], '5.6.7.8')
 
     def test_invalid_cip_response_does_not_write(self):
@@ -129,6 +133,7 @@ class DDNSTests(unittest.TestCase):
         for service, url, body in [
             ('ifconfig.co', 'https://ifconfig.co/ip', '2001:db8::9'),
             ('ipify.org', 'https://api6.ipify.org', '2001:db8::9'),
+            ('ip.sb', 'https://api.ip.sb/ip', '2001:db8::9'),
             ('cip.cc', 'https://www.cip.cc', 'IP : 2001:db8::9'),
         ]:
             code, _, _, api, command, _ = self.invoke([{}, {}], [body],

@@ -148,6 +148,7 @@ REFLECT_URLS = {
     "ifconfig.co": "https://ifconfig.co/ip",
     "ipify.org": "https://api.ipify.org",
     "cip.cc": "https://www.cip.cc",
+    "ip.sb": "https://api.ip.sb/ip",
 }
 
 
@@ -158,12 +159,13 @@ def parse_ip(value, version):
     return str(address)
 
 
-def get_ip(service="ifconfig.co", version=4):
+def get_ip(service="ip.sb", version=4):
     url = "https://api6.ipify.org" if service == "ipify.org" and version == 6 else REFLECT_URLS[service]
+    options = ["--user-agent", "namecom-ddns"] if service == "ip.sb" else []
     try:
         result = subprocess.run(
             ["curl", f"-{version}", "--fail", "--silent", "--show-error",
-             "--max-time", "30", url],
+             "--max-time", "30", *options, url],
             capture_output=True, text=True, timeout=35, check=False,
         )
     except FileNotFoundError:
@@ -241,8 +243,8 @@ def main(argv=None):
     source = parser.add_mutually_exclusive_group()
     source.add_argument("-I", "--interface", metavar="NAME",
                         help="Read the first eligible IP address from a Linux interface")
-    source.add_argument("-R", "--reflect", choices=tuple(REFLECT_URLS), default="ifconfig.co",
-                        help="Public IP reflection service (default: ifconfig.co)")
+    source.add_argument("-R", "--reflect", choices=tuple(REFLECT_URLS), default="ip.sb",
+                        help="Public IP reflection service (default: ip.sb)")
     args = parser.parse_args(argv)
     name = normalize_name(args.name)
     record_type = "A" if args.version == 4 else "AAAA"
