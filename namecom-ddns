@@ -228,7 +228,9 @@ def parse_interval(value):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("name", help="Full DNS record name to keep updated")
+    parser.add_argument("name", nargs="?", help="Full DNS record name (required unless --ip-only)")
+    parser.add_argument("--ip-only", action="store_true",
+                        help="Print the IP once and exit; no configuration or DNS API access")
     parser.add_argument("--config", default="/etc/namecom.ini", metavar="PATH",
                         help="INI configuration (default: /etc/namecom.ini)")
     parser.add_argument("--once", action="store_true", help="Run one iteration and exit")
@@ -246,6 +248,21 @@ def main(argv=None):
     source.add_argument("-R", "--reflect", choices=tuple(REFLECT_URLS), default="ip.sb",
                         help="Public IP reflection service (default: ip.sb)")
     args = parser.parse_args(argv)
+    if args.ip_only:
+        try:
+            if args.interface:
+                value = get_interface_ip(args.interface, args.version)
+            else:
+                value = get_ip(args.reflect, args.version)
+            print(value)
+            return 0
+        except Error as exc:
+            print(f"namecom-ddns: {exc}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            return 130
+    if args.name is None:
+        parser.error("name is required unless --ip-only is specified")
     name = normalize_name(args.name)
     record_type = "A" if args.version == 4 else "AAAA"
     try:
@@ -266,7 +283,10 @@ def main(argv=None):
                     print(f"Existing records: {record_type} {name} = {existing_ips}", file=sys.stderr)
                     if len(records) == 1:
                         known_ip = records[0]["value"]
-                value = get_interface_ip(args.interface, args.version) if args.interface else get_ip(args.reflect, args.version)
+                if args.interface:
+                    value = get_interface_ip(args.interface, args.version)
+                else:
+                    value = get_ip(args.reflect, args.version)
                 if value != known_ip:
                     if records is not None and not records:
                         action = "No existing record, creating"

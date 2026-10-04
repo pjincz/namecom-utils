@@ -27,6 +27,38 @@ class DDNSTests(unittest.TestCase):
                 code = DDNS['main'](args + list(extra))
             return code, out.getvalue(), err.getvalue(), api, curl, sleep
 
+    def test_ip_only_without_config_or_dns(self):
+        for options, body, expected in [
+            ([], '1.2.3.4', '1.2.3.4'),
+            (['-6', '-R', 'ipify.org'], '2001:db8::1', '2001:db8::1'),
+            (['-I', 'eth0'], json.dumps([{'addr_info': [
+                dict(family='inet', local='192.168.1.2')]}]), '192.168.1.2'),
+        ]:
+            out, err = io.StringIO(), io.StringIO()
+            with patch('builtins.open', side_effect=AssertionError('Must not read config')), \
+                    patch('urllib.request.urlopen') as api, patch('time.sleep') as sleep, \
+                    patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, body, '')) as command, \
+                    redirect_stdout(out), redirect_stderr(err):
+                code = DDNS['main'](['--ip-only'] + options)
+            self.assertEqual((code, out.getvalue(), err.getvalue()), (0, expected+'\n', ''))
+            api.assert_not_called()
+            sleep.assert_not_called()
+            command.assert_called_once()
+
+    def test_ip_only_failure_and_missing_domain(self):
+        out, err = io.StringIO(), io.StringIO()
+        with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, 'bad', '')), \
+                patch('urllib.request.urlopen') as api, redirect_stdout(out), redirect_stderr(err):
+            code = DDNS['main'](['--ip-only'])
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), '')
+        self.assertIn('valid IPv4', err.getvalue())
+        api.assert_not_called()
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                DDNS['main']([])
+            self.assertEqual(error.exception.code, 2)
+
     @staticmethod
     def record(i=1, value='1.2.3.4'):
         return dict(id=i, host='x', type='A', answer=value, ttl=600)
