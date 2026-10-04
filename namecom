@@ -112,21 +112,29 @@ def get_records(domain, username, token, name, record_type, include_id=False):
 def add_record(domain, username, token, name, record_type, value, ttl):
     records = get_records(domain, username, token, name, record_type)
     if any(record["value"] == value for record in records):
+        print(f"Already exists, skipped: {record_type} {name} {json.dumps(value, ensure_ascii=False)}",
+              file=sys.stderr)
         return
     host = "" if name == domain else name[:-(len(domain) + 1)]
     url = f"{API_URL}/domains/{urllib.parse.quote(domain, safe='')}/records"
     api_request(url, username, token, {
         "host": host, "type": record_type, "answer": value, "ttl": ttl,
     })
+    print(f"Added: {record_type} {name} {json.dumps(value, ensure_ascii=False)} (TTL {ttl})",
+          file=sys.stderr)
 
 
 def delete_records(domain, username, token, name, record_type):
     # Finish pagination before deleting so records cannot shift between pages.
     records = get_records(domain, username, token, name, record_type, include_id=True)
+    if not records:
+        print(f"No matching records: {record_type} {name}", file=sys.stderr)
     for record in records:
         url = (f"{API_URL}/domains/{urllib.parse.quote(domain, safe='')}/records/"
                f"{record['id']}")
         api_request(url, username, token, method="DELETE")
+        print(f"Deleted: {record_type} {name} {json.dumps(record['value'], ensure_ascii=False)}",
+              file=sys.stderr)
 
 
 def parse_ttl(value):
