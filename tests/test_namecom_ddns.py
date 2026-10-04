@@ -86,6 +86,45 @@ class DDNSTests(unittest.TestCase):
             self.assertIn('cip.cc did not return a valid IPv4', err)
             api.assert_called_once()
 
+    def test_interface_filters_and_preserves_order(self):
+        addresses = [
+            dict(family='inet', local='169.254.1.2', scope='link'),
+            dict(family='inet', local='169.254.2.3', scope='global'),
+            dict(family='inet', local='10.0.0.1', tentative=True),
+            dict(family='inet', local='10.0.0.2', temporary=True),
+            dict(family='inet', local='10.0.0.3', deprecated=True),
+            dict(family='inet', local='10.0.0.4', dadfailed=True),
+            dict(family='inet', local='10.0.0.5', preferred_life_time=0),
+            dict(family='inet6', local='2001:db8::1'),
+            dict(family='inet', local='192.168.1.9', secondary=True),
+            dict(family='inet', local='192.168.1.8'),
+        ]
+        for option in ('-I', '--interface'):
+            code, _, _, api, command, _ = self.invoke([{}, {}],
+                [json.dumps([{'addr_info': addresses}])], extra=[option, 'eth0'])
+            self.assertEqual(code, 0)
+            command.assert_called_once()
+            self.assertEqual(command.call_args.args[0], ['ip', '-j', '-4', 'address', 'show', 'dev', 'eth0'])
+            self.assertEqual(json.loads(api.call_args.args[0].data)['answer'], '192.168.1.9')
+
+    def test_interface_missing_addresses_or_invalid_data(self):
+        for body in ('[]', '[{"addr_info": []}]', 'invalid', '{}'):
+            code, _, err, api, _, _ = self.invoke([{}], [body], extra=['-I', 'eth0'])
+            self.assertEqual(code, 1)
+            self.assertIn('interface eth0', err)
+            api.assert_called_once()
+        for failure in (FileNotFoundError(), subprocess.TimeoutExpired('ip', 10)):
+            with patch('subprocess.run', side_effect=failure):
+                with self.assertRaises(DDNS['Error']):
+                    DDNS['get_interface_ip']('eth0')
+
+    def test_sources_are_mutually_exclusive(self):
+        with redirect_stderr(io.StringIO()), patch('subprocess.run') as command:
+            with self.assertRaises(SystemExit) as error:
+                DDNS['main'](['x.aaa.com', '-I', 'eth0', '-R', 'ifconfig.co'])
+            self.assertEqual(error.exception.code, 2)
+            command.assert_not_called()
+
     def test_invalid_reflection_does_not_write(self):
         for ip in ['::1', '<html>error</html>', '']:
             code, out, err, api, _, _ = self.invoke([{}], [ip])
