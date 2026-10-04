@@ -137,6 +137,31 @@ def delete_records(domain, username, token, name, record_type):
               file=sys.stderr)
 
 
+def set_record(domain, username, token, name, record_type, value, ttl):
+    url = f"{API_URL}/domains/{urllib.parse.quote(domain, safe='')}/records"
+    host = "" if name == domain else name[:-(len(domain) + 1)]
+    while True:
+        records = get_records(domain, username, token, name, record_type, include_id=True)
+        if len(records) > 1:
+            record = records[-1]
+            api_request(f"{url}/{record['id']}", username, token, method="DELETE")
+            print(f"Deleted: {record_type} {name} {json.dumps(record['value'], ensure_ascii=False)}",
+                  file=sys.stderr)
+            continue
+
+        effective_ttl = ttl if ttl is not None else (records[0]["ttl"] if records else 300)
+        payload = {"host": host, "type": record_type, "answer": value, "ttl": effective_ttl}
+        if records:
+            api_request(f"{url}/{records[0]['id']}", username, token, payload, method="PUT")
+            action = "Updated"
+        else:
+            api_request(url, username, token, payload)
+            action = "Added"
+        print(f"{action}: {record_type} {name} {json.dumps(value, ensure_ascii=False)} (TTL {effective_ttl})",
+              file=sys.stderr)
+        return
+
+
 def parse_ttl(value):
     try:
         ttl = int(value)
@@ -155,7 +180,8 @@ def main(argv=None):
     get = commands.add_parser("get", help="Print matching DNS record values")
     add = commands.add_parser("add", help="Add a record unless the same value exists")
     delete = commands.add_parser("del", help="Delete all records matching name and type")
-    for command in (get, add, delete):
+    set_command = commands.add_parser("set", help="Replace matching records with a single record")
+    for command in (get, add, delete, set_command):
         command.add_argument("type", type=str.upper, choices=("A", "AAAA", "CNAME", "TXT"))
         command.add_argument("name", help="Full record name, including the domain")
         command.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
@@ -164,6 +190,9 @@ def main(argv=None):
     add.add_argument("value", help="Record value; compared exactly when checking duplicates")
     add.add_argument("--ttl", type=parse_ttl, default=300, metavar="SECONDS",
                      help="Time to live, at least 300 seconds (default: 300)")
+    set_command.add_argument("value", help="New record value")
+    set_command.add_argument("--ttl", type=parse_ttl, metavar="SECONDS",
+                     help="Time to live (default: preserve existing TTL, or 300 for a new record)")
     args = parser.parse_args(argv)
     name = normalize_name(args.name)
     try:
@@ -173,6 +202,9 @@ def main(argv=None):
             return 0
         if args.command == "del":
             delete_records(domain, username, token, name, args.type)
+            return 0
+        if args.command == "set":
+            set_record(domain, username, token, name, args.type, args.value, args.ttl)
             return 0
         records = get_records(domain, username, token, name, args.type)
     except Error as exc:
