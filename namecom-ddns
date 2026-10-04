@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Name.com IPv4 DDNS; requires Python 3, plus ip for interfaces or curl for reflection."""
+"""Name.com IPv4/IPv6 DDNS; requires Python 3, plus ip for interfaces or curl for reflection."""
 
 import argparse
 import base64
@@ -97,7 +97,7 @@ def get_records(domain, username, token, name, record_type, include_id=False):
                     if not isinstance(value, str):
                         raise ValueError
                     result.append({"name": name, "type": record_type,
-                                   "value": value, "ttl": record["ttl"]})
+                                   "value": str(ipaddress.ip_address(value)), "ttl": record["ttl"]})
                     if include_id:
                         record_id = record["id"]
                         if type(record_id) is not int or record_id <= 0:
@@ -151,11 +151,19 @@ REFLECT_URLS = {
 }
 
 
-def get_ip(service="ifconfig.co"):
+def parse_ip(value, version):
+    address = ipaddress.ip_address(value)
+    if address.version != version or "%" in value:
+        raise ValueError("Wrong address family or scoped address")
+    return str(address)
+
+
+def get_ip(service="ifconfig.co", version=4):
+    url = "https://api6.ipify.org" if service == "ipify.org" and version == 6 else REFLECT_URLS[service]
     try:
         result = subprocess.run(
-            ["curl", "-4", "--fail", "--silent", "--show-error",
-             "--max-time", "30", REFLECT_URLS[service]],
+            ["curl", f"-{version}", "--fail", "--silent", "--show-error",
+             "--max-time", "30", url],
             capture_output=True, text=True, timeout=35, check=False,
         )
     except FileNotFoundError:
@@ -169,15 +177,15 @@ def get_ip(service="ifconfig.co"):
         match = re.search(r"^IP[ \t]*:[ \t]*(\S+)[ \t]*$", value, re.MULTILINE)
         value = match.group(1) if match else ""
     try:
-        return str(ipaddress.IPv4Address(value))
-    except ipaddress.AddressValueError:
-        raise Error(f"{service} did not return a valid IPv4 address") from None
+        return parse_ip(value, version)
+    except ValueError:
+        raise Error(f"{service} did not return a valid IPv{version} address") from None
 
 
-def get_interface_ip(interface):
+def get_interface_ip(interface, version=4):
     try:
         result = subprocess.run(
-            ["ip", "-j", "-4", "address", "show", "dev", interface],
+            ["ip", "-j", f"-{version}", "address", "show", "dev", interface],
             capture_output=True, text=True, timeout=10, check=False,
         )
     except FileNotFoundError:
@@ -189,7 +197,7 @@ def get_interface_ip(interface):
     try:
         for device in json.loads(result.stdout):
             for address in device.get("addr_info", []):
-                if address.get("family") != "inet":
+                if address.get("family") != ("inet" if version == 4 else "inet6"):
                     continue
                 if address.get("scope") == "link":
                     continue
@@ -198,12 +206,12 @@ def get_interface_ip(interface):
                     continue
                 if address.get("valid_life_time") == 0 or address.get("preferred_life_time") == 0:
                     continue
-                value = ipaddress.IPv4Address(address["local"])
+                value = ipaddress.ip_address(parse_ip(address["local"], version))
                 if not value.is_link_local:
                     return str(value)
     except (ValueError, KeyError, TypeError, AttributeError):
         raise Error(f"Invalid address data for interface {interface}") from None
-    raise Error(f"No eligible IPv4 address on interface {interface}")
+    raise Error(f"No eligible IPv{version} address on interface {interface}")
 
 
 def parse_interval(value):
@@ -224,13 +232,20 @@ def main(argv=None):
     parser.add_argument("--once", action="store_true", help="Run one iteration and exit")
     parser.add_argument("--interval", type=parse_interval, default=60, metavar="SECONDS",
                         help="Wait between iterations, including after errors (default: 60)")
+    family = parser.add_mutually_exclusive_group()
+    family.add_argument("-4", "--ipv4", dest="version", action="store_const", const=4,
+                        help="Manage an A record (default)")
+    family.add_argument("-6", "--ipv6", dest="version", action="store_const", const=6,
+                        help="Manage an AAAA record")
+    parser.set_defaults(version=4)
     source = parser.add_mutually_exclusive_group()
     source.add_argument("-I", "--interface", metavar="NAME",
-                        help="Read the first eligible IPv4 address from a Linux interface")
+                        help="Read the first eligible IP address from a Linux interface")
     source.add_argument("-R", "--reflect", choices=tuple(REFLECT_URLS), default="ifconfig.co",
                         help="Public IP reflection service (default: ifconfig.co)")
     args = parser.parse_args(argv)
     name = normalize_name(args.name)
+    record_type = "A" if args.version == 4 else "AAAA"
     try:
         domain, username, token = load_account(args.config, name)
     except Error as exc:
@@ -244,12 +259,12 @@ def main(argv=None):
             try:
                 records = None
                 if known_ip is None:
-                    records = get_records(domain, username, token, name, "A", include_id=True)
+                    records = get_records(domain, username, token, name, record_type, include_id=True)
                     existing_ips = ", ".join(record["value"] for record in records) or "(none)"
-                    print(f"Existing records: A {name} = {existing_ips}", file=sys.stderr)
+                    print(f"Existing records: {record_type} {name} = {existing_ips}", file=sys.stderr)
                     if len(records) == 1:
                         known_ip = records[0]["value"]
-                value = get_interface_ip(args.interface) if args.interface else get_ip(args.reflect)
+                value = get_interface_ip(args.interface, args.version) if args.interface else get_ip(args.reflect, args.version)
                 if value != known_ip:
                     if records is not None and not records:
                         action = "No existing record, creating"
@@ -257,11 +272,11 @@ def main(argv=None):
                         action = "Multiple records, replacing with one"
                     else:
                         action = f"Record differs ({known_ip}), updating"
-                    print(f"{action}: A {name} = {value}", file=sys.stderr)
-                    set_record(domain, username, token, name, "A", value, None, records)
+                    print(f"{action}: {record_type} {name} = {value}", file=sys.stderr)
+                    set_record(domain, username, token, name, record_type, value, None, records)
                     known_ip = value
                 else:
-                    print(f"Record matches, skipped: A {name} = {value}", file=sys.stderr)
+                    print(f"Record matches, skipped: {record_type} {name} = {value}", file=sys.stderr)
             except Error as exc:
                 print(f"namecom-ddns: {exc}", file=sys.stderr)
                 known_ip = None

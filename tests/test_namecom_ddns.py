@@ -125,6 +125,66 @@ class DDNSTests(unittest.TestCase):
             self.assertEqual(error.exception.code, 2)
             command.assert_not_called()
 
+    def test_ipv6_reflection_creates_aaaa(self):
+        for service, url, body in [
+            ('ifconfig.co', 'https://ifconfig.co/ip', '2001:db8::9'),
+            ('ipify.org', 'https://api6.ipify.org', '2001:db8::9'),
+            ('cip.cc', 'https://www.cip.cc', 'IP : 2001:db8::9'),
+        ]:
+            code, _, _, api, command, _ = self.invoke([{}, {}], [body],
+                extra=['-6', '-R', service])
+            self.assertEqual(code, 0)
+            self.assertIn('-6', command.call_args.args[0])
+            self.assertEqual(command.call_args.args[0][-1], url)
+            self.assertEqual(json.loads(api.call_args.args[0].data),
+                             dict(host='x', type='AAAA', answer='2001:db8::9', ttl=300))
+
+    def test_ipv6_interface_filters_and_keeps_ula(self):
+        addresses = [dict(family='inet6', local='fe80::1', scope='link')]
+        for flag in ('temporary', 'tentative', 'deprecated', 'dadfailed'):
+            addresses.append(dict(family='inet6', local='2001:db8::1', **{flag: True}))
+        addresses += [dict(family='inet', local='192.168.1.1'),
+                      dict(family='inet6', local='fd00::1', mngtmpaddr=True),
+                      dict(family='inet6', local='2001:db8::2')]
+        code, _, _, api, command, _ = self.invoke([{}, {}],
+            [json.dumps([{'addr_info': addresses}])], extra=['--ipv6', '-I', 'eth0'])
+        self.assertEqual(code, 0)
+        self.assertIn('-6', command.call_args.args[0])
+        self.assertEqual(json.loads(api.call_args.args[0].data)['answer'], 'fd00::1')
+
+    def test_ipv6_equivalent_notations_skip_update(self):
+        record = dict(id=1, host='x', type='AAAA', answer='2001:0DB8:0:0:0:0:0:1', ttl=600)
+        code, _, err, api, _, _ = self.invoke([{'records': [record, self.record()]}],
+                                             ['2001:db8::1'], extra=['-6'])
+        self.assertEqual(code, 0)
+        self.assertIn('Record matches, skipped: AAAA', err)
+        api.assert_called_once()
+
+    def test_ipv6_duplicates_and_update_preserve_a(self):
+        first = dict(id=1, host='x', type='AAAA', answer='2001:db8::1', ttl=600)
+        second = dict(first, id=2)
+        code, _, _, api, _, _ = self.invoke([
+            {'records': [self.record(3), first, second]}, {},
+            {'records': [self.record(3), first]}, {},
+        ], ['2001:db8::9'], extra=['-6'])
+        self.assertEqual(code, 0)
+        calls = [c.args[0] for c in api.call_args_list]
+        self.assertEqual([c.get_method() for c in calls], ['GET', 'DELETE', 'GET', 'PUT'])
+        self.assertTrue(calls[1].full_url.endswith('/2'))
+        self.assertTrue(calls[-1].full_url.endswith('/1'))
+        self.assertEqual(json.loads(calls[-1].data)['ttl'], 600)
+
+    def test_ipv6_rejects_ipv4_and_scoped_output(self):
+        for body in ('1.2.3.4', 'fe80::1%eth0'):
+            code, _, err, api, _, _ = self.invoke([{}], [body], extra=['-6'])
+            self.assertEqual(code, 1)
+            self.assertIn('valid IPv6', err)
+            api.assert_called_once()
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                DDNS['main'](['x.aaa.com', '-4', '-6'])
+            self.assertEqual(error.exception.code, 2)
+
     def test_invalid_reflection_does_not_write(self):
         for ip in ['::1', '<html>error</html>', '']:
             code, out, err, api, _, _ = self.invoke([{}], [ip])
