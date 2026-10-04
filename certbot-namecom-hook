@@ -162,8 +162,8 @@ def main(argv=None):
     for command in (auth_parser, cleanup_parser):
         command.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
                              help="INI configuration (default: /etc/namecom.ini)")
-    auth_parser.add_argument("--wait", type=parse_wait, default=25, metavar="SECONDS",
-                             help="Propagation wait per challenge (default: 25; 0 disables waiting)")
+    auth_parser.add_argument("--wait", type=parse_wait, default=5, metavar="SECONDS",
+                             help="Propagation wait per challenge (default: 5; 0 disables waiting)")
     args = parser.parse_args(argv)
     try:
         if args.command == "auth":
