@@ -103,7 +103,12 @@ def auth(config, wait):
     record_id = response.get("id") if isinstance(response, dict) else None
     if type(record_id) is not int or record_id <= 0:
         raise Error("Name.com API returned no valid record ID; check DNS for an orphaned TXT record")
-    if wait:
+    # Certbot creates all challenge records before submitting them for validation.
+    try:
+        remaining = int(os.environ.get("CERTBOT_REMAINING_CHALLENGES", "0"))
+    except ValueError:
+        remaining = 0
+    if wait and remaining <= 0:
         time.sleep(wait)
 
 
@@ -163,7 +168,7 @@ def main(argv=None):
         command.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
                              help="INI configuration (default: /etc/namecom.ini)")
     auth_parser.add_argument("--wait", type=parse_wait, default=5, metavar="SECONDS",
-                             help="Propagation wait per challenge (default: 5; 0 disables waiting)")
+                             help="Propagation wait after the last challenge (default: 5; 0 disables waiting)")
     args = parser.parse_args(argv)
     try:
         if args.command == "auth":

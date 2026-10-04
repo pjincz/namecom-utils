@@ -39,7 +39,26 @@ class HookTests(unittest.TestCase):
         self.assertEqual(request.get_method(), 'POST')
         self.assertEqual(json.loads(request.data), {'host': '_acme-challenge',
                          'type': 'TXT', 'answer': 'challenge-1', 'ttl': 300})
-        sleep.assert_called_once_with(25)
+        sleep.assert_called_once_with(5)
+
+    def test_only_last_challenge_waits(self):
+        env = {'CERTBOT_DOMAIN': 'aaa.com', 'CERTBOT_VALIDATION': 'value'}
+        for remaining in ('2', '1', '0'):
+            env['CERTBOT_REMAINING_CHALLENGES'] = remaining
+            code, out, err, api, sleep = self.invoke(['auth', '--wait', '7'], env, [{'id': 123}])
+            self.assertEqual((code, out, err), (0, '', ''))
+            api.assert_called_once()
+            if remaining == '0':
+                sleep.assert_called_once_with(7)
+            else:
+                sleep.assert_not_called()
+        for remaining in ('invalid', '', '-1'):
+            env['CERTBOT_REMAINING_CHALLENGES'] = remaining
+            _, _, _, _, sleep = self.invoke(['auth'], env, [{'id': 123}])
+            sleep.assert_called_once_with(5)
+        env['CERTBOT_REMAINING_CHALLENGES'] = '0'
+        _, _, _, _, sleep = self.invoke(['auth', '--wait', '0'], env, [{'id': 123}])
+        sleep.assert_not_called()
 
     def test_cleanup_all_matching_txt_across_pages(self):
         env = {'CERTBOT_DOMAIN': 'aaa.com'}
