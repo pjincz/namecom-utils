@@ -110,11 +110,6 @@ def get_records(domain, username, token, name, record_type, include_id=False):
 
 
 def add_record(domain, username, token, name, record_type, value, ttl):
-    records = get_records(domain, username, token, name, record_type)
-    if any(record["value"] == value for record in records):
-        print(f"Already exists, skipped: {record_type} {name} {json.dumps(value, ensure_ascii=False)}",
-              file=sys.stderr)
-        return
     host = "" if name == domain else name[:-(len(domain) + 1)]
     url = f"{API_URL}/domains/{urllib.parse.quote(domain, safe='')}/records"
     api_request(url, username, token, {
@@ -150,6 +145,10 @@ def set_record(domain, username, token, name, record_type, value, ttl):
             continue
 
         effective_ttl = ttl if ttl is not None else (records[0]["ttl"] if records else 300)
+        if records and records[0]["value"] == value and records[0]["ttl"] == effective_ttl:
+            print(f"Already matches, skipped: {record_type} {name} {json.dumps(value, ensure_ascii=False)} (TTL {effective_ttl})",
+                  file=sys.stderr)
+            return
         payload = {"host": host, "type": record_type, "answer": value, "ttl": effective_ttl}
         if records:
             api_request(f"{url}/{records[0]['id']}", username, token, payload, method="PUT")
@@ -178,7 +177,7 @@ def main(argv=None):
                         help="INI configuration (default: /etc/namecom.ini)")
     commands = parser.add_subparsers(dest="command", required=True)
     get = commands.add_parser("get", help="Print matching DNS record values")
-    add = commands.add_parser("add", help="Add a record unless the same value exists")
+    add = commands.add_parser("add", help="Add a record without checking for duplicates")
     delete = commands.add_parser("del", help="Delete all records matching name and type")
     set_command = commands.add_parser("set", help="Replace matching records with a single record")
     for command in (get, add, delete, set_command):
@@ -187,7 +186,7 @@ def main(argv=None):
         command.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
                              help="INI configuration (default: /etc/namecom.ini)")
     get.add_argument("--json", action="store_true", help="Print record objects as JSON")
-    add.add_argument("value", help="Record value; compared exactly when checking duplicates")
+    add.add_argument("value", help="Record value")
     add.add_argument("--ttl", type=parse_ttl, default=300, metavar="SECONDS",
                      help="Time to live, at least 300 seconds (default: 300)")
     set_command.add_argument("value", help="New record value")
