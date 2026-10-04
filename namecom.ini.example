@@ -1,0 +1,7 @@
+[aaa.com]
+username = a-account
+token = a-key
+
+[bbb.com.uk]
+username = b-account
+token = b-key
