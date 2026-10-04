@@ -51,13 +51,15 @@ def load_account(path, name):
     return domain, username, token
 
 
-def api_request(domain, username, token, payload=None, record_id=None):
+def api_request(domain, username, token, payload=None, record_id=None, page=None):
     url = f"{API_URL}/domains/{urllib.parse.quote(domain, safe='')}/records"
     credentials = base64.b64encode(f"{username}:{token}".encode()).decode("ascii")
     headers = {"Authorization": f"Basic {credentials}", "Accept": "application/json"}
     body = None
-    method = "DELETE" if record_id is not None else "POST"
-    if record_id is not None:
+    method = "GET" if page is not None else ("DELETE" if record_id is not None else "POST")
+    if page is not None:
+        url += "?" + urllib.parse.urlencode({"page": page, "perPage": 1000})
+    elif record_id is not None:
         url += f"/{record_id}"
     else:
         body = json.dumps(payload).encode("utf-8")
@@ -101,32 +103,43 @@ def auth(config, wait):
     record_id = response.get("id") if isinstance(response, dict) else None
     if type(record_id) is not int or record_id <= 0:
         raise Error("Name.com API returned no valid record ID; check DNS for an orphaned TXT record")
-    # Certbot passes this stdout back to the corresponding cleanup invocation.
-    # Flush before waiting so cleanup information is not held in a buffer.
-    print(json.dumps({"domain": domain, "name": name, "id": record_id}), flush=True)
     if wait:
         time.sleep(wait)
 
 
+def get_records(domain, username, token, name, record_type):
+    records = []
+    page = 1
+    while True:
+        data = api_request(domain, username, token, page=page)
+        try:
+            for record in data.get("records", []):
+                host = record.get("host", "")
+                fqdn = record.get("fqdn") or (
+                    domain if host in ("", "@") else f"{host}.{domain}"
+                )
+                if normalize_name(fqdn) == name and record["type"].upper() == record_type:
+                    record_id = record["id"]
+                    if type(record_id) is not int or record_id <= 0:
+                        raise ValueError
+                    records.append(record)
+            next_page = data.get("nextPage")
+            if not next_page:
+                return records
+            if type(next_page) is not int or next_page <= page:
+                raise ValueError
+            page = next_page
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise Error("Name.com API returned an invalid records response") from None
+
+
 def cleanup(config):
-    output = os.environ.get("CERTBOT_AUTH_OUTPUT", "").strip()
-    if not output:
-        return
-    try:
-        state = json.loads(output)
-        domain, name, record_id = state["domain"], state["name"], state["id"]
-        if not isinstance(domain, str) or not domain or not isinstance(name, str):
-            raise ValueError
-        if type(record_id) is not int or record_id <= 0:
-            raise ValueError
-    except (ValueError, KeyError, TypeError):
-        raise Error("Invalid CERTBOT_AUTH_OUTPUT") from None
-    if name != challenge_name():
-        raise Error("Auth output does not match the current challenge domain")
-    configured_domain, username, token = load_account(config, name)
-    if domain != configured_domain:
-        raise Error("Auth output domain does not match the configured domain")
-    api_request(domain, username, token, record_id=record_id)
+    name = challenge_name()
+    domain, username, token = load_account(config, name)
+    # Collect all pages before deleting, so deletion cannot shift pagination.
+    records = get_records(domain, username, token, name, "TXT")
+    for record in records:
+        api_request(domain, username, token, record_id=record["id"])
 
 
 def parse_wait(value):
@@ -145,7 +158,7 @@ def main(argv=None):
                         help="INI configuration (default: /etc/namecom.ini)")
     commands = parser.add_subparsers(dest="command", required=True)
     auth_parser = commands.add_parser("auth", help="Create the challenge TXT record and wait")
-    cleanup_parser = commands.add_parser("cleanup", help="Delete only the record created by auth")
+    cleanup_parser = commands.add_parser("cleanup", help="Delete all TXT records at the current challenge name")
     for command in (auth_parser, cleanup_parser):
         command.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
                              help="INI configuration (default: /etc/namecom.ini)")
