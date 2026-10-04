@@ -49,28 +49,35 @@ def load_account(path, name):
     return domain, username, token
 
 
-def get_records(domain, username, token, name, record_type):
+def api_request(url, username, token, payload=None):
     authorization = base64.b64encode(
         f"{username}:{token}".encode("utf-8")
     ).decode("ascii")
+    headers = {"Authorization": f"Basic {authorization}",
+               "Accept": "application/json"}
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise Error(f"Name.com API returned HTTP {exc.code}") from None
+    except (urllib.error.URLError, OSError):
+        raise Error("Name.com request failed (network error or timeout)") from None
+    except (ValueError, UnicodeError):
+        raise Error("Name.com API returned invalid JSON") from None
+
+
+def get_records(domain, username, token, name, record_type):
     result = []
     page = 1
     while True:
         query = urllib.parse.urlencode({"page": page, "perPage": 1000})
         url = f"{API_URL}/domains/{urllib.parse.quote(domain, safe='')}/records?{query}"
-        request = urllib.request.Request(url, headers={
-            "Authorization": f"Basic {authorization}",
-            "Accept": "application/json",
-        })
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                data = json.load(response)
-        except urllib.error.HTTPError as exc:
-            raise Error(f"Name.com API returned HTTP {exc.code}") from None
-        except (urllib.error.URLError, OSError):
-            raise Error("Name.com request failed (network error or timeout)") from None
-        except (ValueError, UnicodeError):
-            raise Error("Name.com API returned invalid JSON") from None
+        data = api_request(url, username, token)
 
         try:
             for record in data.get("records", []):
@@ -95,21 +102,50 @@ def get_records(domain, username, token, name, record_type):
             raise Error("Name.com API returned an invalid records response") from None
 
 
+def add_record(domain, username, token, name, record_type, value, ttl):
+    records = get_records(domain, username, token, name, record_type)
+    if any(record["value"] == value for record in records):
+        return
+    host = "" if name == domain else name[:-(len(domain) + 1)]
+    url = f"{API_URL}/domains/{urllib.parse.quote(domain, safe='')}/records"
+    api_request(url, username, token, {
+        "host": host, "type": record_type, "answer": value, "ttl": ttl,
+    })
+
+
+def parse_ttl(value):
+    try:
+        ttl = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("TTL must be an integer") from None
+    if not 300 <= ttl <= 4294967295:
+        raise argparse.ArgumentTypeError("TTL must be between 300 and 4294967295 seconds")
+    return ttl
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="/etc/namecom.ini", metavar="PATH",
                         help="INI configuration (default: /etc/namecom.ini)")
     commands = parser.add_subparsers(dest="command", required=True)
     get = commands.add_parser("get", help="Print matching DNS record values")
-    get.add_argument("type", type=str.upper, choices=("A", "AAAA", "CNAME", "TXT"))
-    get.add_argument("name", help="Full record name, including the domain")
+    add = commands.add_parser("add", help="Add a record unless the same value exists")
+    for command in (get, add):
+        command.add_argument("type", type=str.upper, choices=("A", "AAAA", "CNAME", "TXT"))
+        command.add_argument("name", help="Full record name, including the domain")
+        command.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
+                             help="INI configuration (default: /etc/namecom.ini)")
     get.add_argument("--json", action="store_true", help="Print record objects as JSON")
-    get.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
-                     help="INI configuration (default: /etc/namecom.ini)")
+    add.add_argument("value", help="Record value; compared exactly when checking duplicates")
+    add.add_argument("--ttl", type=parse_ttl, default=300, metavar="SECONDS",
+                     help="Time to live, at least 300 seconds (default: 300)")
     args = parser.parse_args(argv)
     name = normalize_name(args.name)
     try:
         domain, username, token = load_account(args.config, name)
+        if args.command == "add":
+            add_record(domain, username, token, name, args.type, args.value, args.ttl)
+            return 0
         records = get_records(domain, username, token, name, args.type)
     except Error as exc:
         print(f"namecom: {exc}", file=sys.stderr)
