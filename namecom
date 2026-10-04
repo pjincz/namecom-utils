@@ -99,7 +99,7 @@ def get_records(domain, username, token, name=None, record_type=None, include_id
                         raise ValueError
                     result.append({"name": normalize_name(fqdn), "type": record["type"].upper(),
                                    "value": value, "ttl": record["ttl"]})
-                    if name is None and "priority" in record:
+                    if "priority" in record:
                         result[-1]["priority"] = record["priority"]
                     if include_id:
                         record_id = record["id"]
@@ -130,12 +130,12 @@ def delete_records(domain, username, token, name, record_type):
     # Finish pagination before deleting so records cannot shift between pages.
     records = get_records(domain, username, token, name, record_type, include_id=True)
     if not records:
-        print(f"No matching records: {record_type} {name}", file=sys.stderr)
+        print(f"No matching records: {record_type or 'ALL'} {name}", file=sys.stderr)
     for record in records:
         url = (f"{API_URL}/domains/{urllib.parse.quote(domain, safe='')}/records/"
                f"{record['id']}")
         api_request(url, username, token, method="DELETE")
-        print(f"Deleted: {record_type} {name} {json.dumps(record['value'], ensure_ascii=False)}",
+        print(f"Deleted: {record['type']} {name} {json.dumps(record['value'], ensure_ascii=False)}",
               file=sys.stderr)
 
 
@@ -183,9 +183,9 @@ def main(argv=None):
     parser.add_argument("--config", default="/etc/namecom.ini", metavar="PATH",
                         help="INI configuration (default: /etc/namecom.ini)")
     commands = parser.add_subparsers(dest="command", required=True)
-    get = commands.add_parser("get", help="Print matching DNS record values")
+    get = commands.add_parser("get", help="Print matching DNS records")
     add = commands.add_parser("add", help="Add a record without checking for duplicates")
-    delete = commands.add_parser("del", help="Delete all records matching name and type")
+    delete = commands.add_parser("del", help="Delete all records matching name and optional type")
     set_command = commands.add_parser("set", help="Replace matching records with a single record")
     list_command = commands.add_parser("list", help="List all records in a configured domain zone")
     list_command.add_argument("name", nargs="?", metavar="DOMAIN",
@@ -194,10 +194,15 @@ def main(argv=None):
     list_command.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
                               help="INI configuration (default: /etc/namecom.ini)")
     for command in (get, add, delete, set_command):
-        command.add_argument("type", type=str.upper, choices=("A", "AAAA", "CNAME", "TXT"))
         command.add_argument("name", help="Full record name, including the domain")
         command.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
                              help="INI configuration (default: /etc/namecom.ini)")
+    for command in (get, delete):
+        command.add_argument("type", nargs="?", type=str.upper,
+                             choices=("A", "AAAA", "CNAME", "TXT"),
+                             help="Record type (default: all types)")
+    for command in (add, set_command):
+        command.add_argument("type", type=str.upper, choices=("A", "AAAA", "CNAME", "TXT"))
     get.add_argument("--json", action="store_true", help="Print record objects as JSON")
     add.add_argument("value", help="Record value")
     add.add_argument("--ttl", type=parse_ttl, default=300, metavar="SECONDS",
@@ -230,20 +235,17 @@ def main(argv=None):
             set_record(domain, username, token, name, args.type, args.value, args.ttl)
             return 0
         if args.command == "get":
-            records = get_records(domain, username, token, name, args.type)
+            records = get_records(domain, username, token, name, args.type, include_id=True)
     except Error as exc:
         print(f"namecom: {exc}", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(records, ensure_ascii=False, indent=2))
-    elif args.command == "list":
+    else:
         for record in records:
             priority = f" priority={record['priority']}" if "priority" in record else ""
             print(f"{record['name']}\t{record['type']}\t"
                   f"{json.dumps(record['value'], ensure_ascii=False)}\tTTL={record['ttl']}{priority}")
-    else:
-        for record in records:
-            print(record["value"])
     return 0
 
 
