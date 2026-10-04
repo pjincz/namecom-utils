@@ -235,9 +235,9 @@ directly:
 
 ```sh
 certbot certonly --manual --preferred-challenges dns \
-  --manual-auth-hook "/usr/bin/env /absolute/path/certbot-namecom-hook auth \
+  --manual-auth-hook "/absolute/path/certbot-namecom-hook auth \
     --config /absolute/path/namecom.ini --wait 25" \
-  --manual-cleanup-hook "/usr/bin/env /absolute/path/certbot-namecom-hook \
+  --manual-cleanup-hook "/absolute/path/certbot-namecom-hook \
     cleanup --config /absolute/path/namecom.ini" \
   -d aaa.com -d '*.aaa.com'
 ```
@@ -266,3 +266,22 @@ name. It is intended for small-tool use cases that do not require coordination
 between concurrent requests. The hook is silent on success. On failure, it
 writes to stderr and exits with a nonzero status. It does not pass state to
 cleanup through stdout.
+
+### Installing certificates with nginx
+
+To validate domains using the DNS hook and let Certbot install the certificate
+and update nginx configuration, select the authenticator and installer
+separately:
+
+- `-i nginx`: Uses the nginx installer. Requires Certbot's nginx plugin.
+- `-a manual`: Uses the manual plugin and hooks for DNS-01 validation.
+
+In this case, we strongly recommend placing `namecom.ini` at `/etc/namecom.ini`
+to avoid missing configuration files or access permission (ACL) issues during
+certificate renewal.
+
+```sh
+sudo certbot -i nginx -a manual --preferred-challenges dns \
+  --manual-auth-hook "/absolute/path/certbot-namecom-hook auth" \
+  --manual-cleanup-hook "/absolute/path/certbot-namecom-hook cleanup"
+```

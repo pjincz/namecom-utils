@@ -198,9 +198,9 @@ DNS。首次运行时，Certbot 可能要求输入邮箱、接受服务条款等
 
 ```sh
 certbot certonly --manual --preferred-challenges dns \
-  --manual-auth-hook "/usr/bin/env /absolute/path/certbot-namecom-hook auth \
+  --manual-auth-hook "/absolute/path/certbot-namecom-hook auth \
     --config /absolute/path/namecom.ini --wait 25" \
-  --manual-cleanup-hook "/usr/bin/env /absolute/path/certbot-namecom-hook \
+  --manual-cleanup-hook "/absolute/path/certbot-namecom-hook \
     cleanup --config /absolute/path/namecom.ini" \
   -d aaa.com -d '*.aaa.com'
 ```
@@ -221,3 +221,20 @@ Hook 从 Certbot 环境变量中获取域名和验证值，只支持 DNS-01：
 这种清理方式可能影响同时使用相同 challenge 名称的其他申请，适用于不需要协调并发
 申请的小工具场景。成功时 hook 保持静默，失败时写入 stderr 并非零退出，不通过
 stdout 向 cleanup 传递状态。
+
+### 配合 nginx 安装证书
+
+要使用 DNS hook 验证域名，并让 Certbot 自动安装证书、修改 nginx 配置，
+可以分别指定验证插件和安装插件：
+
+- `-i nginx`：使用 nginx 插件安装证书，需要已安装 Certbot 的 nginx 插件。
+- `-a manual`：使用 manual 插件，通过 hook 完成 DNS-01 验证。
+
+这种情况下，强烈建议将 `namecom.ini` 放在 `/etc/namecom.ini`，
+以免证书续订时找不到配置文件，或因访问权限（ACL）问题无法读取。
+
+```sh
+sudo certbot -i nginx -a manual --preferred-challenges dns \
+  --manual-auth-hook "/absolute/path/certbot-namecom-hook auth" \
+  --manual-cleanup-hook "/absolute/path/certbot-namecom-hook cleanup"
+```
