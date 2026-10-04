@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: request-cert domain1 [domain2 ...] [-o DIR] [--config PATH]
+
+Request one certificate for all listed domains using Name.com DNS validation.
+Copy fullchain.pem and privkey.pem to DIR (default: current directory).
+Quote wildcard domains, for example: request-cert example.com '*.example.com'
+
+Requires certbot on PATH and certbot-namecom-hook beside this script.
+--config selects the Name.com INI file (default: /etc/namecom.ini).
+Certbot uses ~/.letsencrypt for its configuration, work files, and logs.
+Existing output files are replaced. Run again to refresh the exported copies;
+Certbot's automatic renewal alone does not update these copies.
+EOF
+}
+
+fail() {
+    printf 'request-cert: %s\n' "$*" >&2
+    exit 1
+}
+
+output_dir=.
+config=/etc/namecom.ini
+domains=()
+while (($#)); do
+    case "$1" in
+        --config)
+            (($# >= 2)) && [[ -n "$2" ]] || fail "$1 requires a path"
+            config=$2
+            shift 2
+            ;;
+        -o|--output)
+            (($# >= 2)) && [[ -n "$2" ]] || fail "$1 requires a directory"
+            output_dir=$2
+            shift 2
+            ;;
+        -h|--help) usage; exit 0 ;;
+        -*) fail "Unknown option: $1" ;;
+        *) domains+=("$1"); shift ;;
+    esac
+done
+((${#domains[@]})) || { usage >&2; exit 1; }
+
+# Domain validation also keeps the certificate name safe as a path component.
+for domain in "${domains[@]}"; do
+    [[ "$domain" =~ ^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.?$ ]] \
+        || fail "Invalid domain: $domain"
+done
+cert_name=${domains[0]#\*.}
+cert_name=${cert_name%.}
+cert_name=${cert_name,,}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+hook="$script_dir/certbot-namecom-hook"
+[[ -x "$hook" ]] || fail "Hook is missing or not executable: $hook"
+command -v certbot >/dev/null || fail "certbot was not found"
+
+# Persist an absolute config path so renewal does not depend on the working directory.
+if [[ "$config" != /* ]]; then
+    config="$PWD/$config"
+fi
+# Hook commands run through a shell; use POSIX single-quote escaping for paths.
+quoted_hook="'${hook//\'/\'\\\'\'}'"
+quoted_config="'${config//\'/\'\\\'\'}'"
+# Certbot 2.x checks the first whitespace-delimited word without unquoting it.
+# A fixed executable prefix keeps validation compatible with quoted hook paths.
+certbot_domains=()
+for domain in "${domains[@]}"; do
+    certbot_domains+=(-d "$domain")
+done
+mkdir -p -- "$output_dir"
+certbot_dir="$HOME/.letsencrypt"
+certbot certonly --manual --preferred-challenges dns \
+    --manual-auth-hook "/usr/bin/env $quoted_hook auth --config $quoted_config" \
+    --manual-cleanup-hook "/usr/bin/env $quoted_hook cleanup --config $quoted_config" \
+    --config-dir "$certbot_dir" \
+    --work-dir "$certbot_dir" \
+    --logs-dir "$certbot_dir" \
+    --cert-name "$cert_name" --keep-until-expiring \
+    "${certbot_domains[@]}"
+
+# Stage both files before replacing the exported copies; keep the key private.
+umask 077
+stage=$(mktemp -d "$output_dir/.request-cert.XXXXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+lineage="$certbot_dir/live/$cert_name"
+install -m 644 -- "$lineage/fullchain.pem" "$stage/fullchain.pem"
+install -m 600 -- "$lineage/privkey.pem" "$stage/privkey.pem"
+mv -fT -- "$stage/fullchain.pem" "$output_dir/fullchain.pem"
+mv -fT -- "$stage/privkey.pem" "$output_dir/privkey.pem"
+printf 'Saved: %s/fullchain.pem\nSaved: %s/privkey.pem\n' "$output_dir" "$output_dir"
