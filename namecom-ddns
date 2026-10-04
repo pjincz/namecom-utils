@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Name.com IPv4 DDNS using public IP reflection; requires Python 3 and curl."""
+
+import argparse
+import base64
+import configparser
+import json
+import ipaddress
+import re
+import subprocess
+import time
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+API_URL = "https://api.name.com/core/v1"
+
+
+class Error(Exception):
+    pass
+
+
+def normalize_name(name):
+    return name.rstrip(".").lower()
+
+
+def load_account(path, name):
+    config = configparser.ConfigParser(interpolation=None)
+    try:
+        with open(path, encoding="utf-8") as stream:
+            config.read_file(stream)
+    except OSError:
+        raise Error(f"Cannot read configuration: {path}") from None
+    except (configparser.Error, UnicodeError):
+        # ConfigParser errors can contain source lines, including credentials.
+        raise Error(f"Invalid INI configuration: {path}") from None
+
+    matches = [
+        (normalize_name(section), section) for section in config.sections()
+        if normalize_name(section)
+        and (name == normalize_name(section)
+             or name.endswith("." + normalize_name(section)))
+    ]
+    if not matches:
+        raise Error(f"No configured domain matches {name}")
+    domain, section = max(matches, key=lambda item: len(item[0]))
+    username = config.get(section, "username", fallback="").strip()
+    token = config.get(section, "token", fallback="").strip()
+    if not username or not token:
+        raise Error(f"Configuration [{section}] requires username and token")
+    return domain, username, token
+
+
+def api_request(url, username, token, payload=None, method=None):
+    authorization = base64.b64encode(
+        f"{username}:{token}".encode("utf-8")
+    ).decode("ascii")
+    headers = {"Authorization": f"Basic {authorization}",
+               "Accept": "application/json"}
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            if method == "DELETE":
+                return None
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise Error(f"Name.com API returned HTTP {exc.code}") from None
+    except (urllib.error.URLError, OSError):
+        raise Error("Name.com request failed (network error or timeout)") from None
+    except (ValueError, UnicodeError):
+        raise Error("Name.com API returned invalid JSON") from None
+
+
+def get_records(domain, username, token, name, record_type, include_id=False):
+    result = []
+    page = 1
+    while True:
+        query = urllib.parse.urlencode({"page": page, "perPage": 1000})
+        url = f"{API_URL}/domains/{urllib.parse.quote(domain, safe='')}/records?{query}"
+        data = api_request(url, username, token)
+
+        try:
+            for record in data.get("records", []):
+                host = record.get("host", "")
+                fqdn = record.get("fqdn") or (
+                    domain if host in ("", "@") else f"{host}.{domain}"
+                )
+                if (normalize_name(fqdn) == name
+                        and record["type"].upper() == record_type):
+                    value = record["answer"]
+                    if not isinstance(value, str):
+                        raise ValueError
+                    result.append({"name": name, "type": record_type,
+                                   "value": value, "ttl": record["ttl"]})
+                    if include_id:
+                        record_id = record["id"]
+                        if type(record_id) is not int or record_id <= 0:
+                            raise ValueError
+                        result[-1]["id"] = record_id
+            next_page = data.get("nextPage")
+            if not next_page:
+                return result
+            if not isinstance(next_page, int) or next_page <= page:
+                raise ValueError
+            page = next_page
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise Error("Name.com API returned an invalid records response") from None
+
+
+def set_record(domain, username, token, name, record_type, value, ttl, records=None):
+    url = f"{API_URL}/domains/{urllib.parse.quote(domain, safe='')}/records"
+    host = "" if name == domain else name[:-(len(domain) + 1)]
+    while True:
+        if records is None:
+            records = get_records(domain, username, token, name, record_type, include_id=True)
+        if len(records) > 1:
+            record = records[-1]
+            api_request(f"{url}/{record['id']}", username, token, method="DELETE")
+            print(f"Deleted: {record_type} {name} {json.dumps(record['value'], ensure_ascii=False)}",
+                  file=sys.stderr)
+            records = None
+            continue
+
+        effective_ttl = ttl if ttl is not None else (records[0]["ttl"] if records else 300)
+        if records and records[0]["value"] == value and records[0]["ttl"] == effective_ttl:
+            print(f"Already matches, skipped: {record_type} {name} {json.dumps(value, ensure_ascii=False)} (TTL {effective_ttl})",
+                  file=sys.stderr)
+            return
+        payload = {"host": host, "type": record_type, "answer": value, "ttl": effective_ttl}
+        if records:
+            api_request(f"{url}/{records[0]['id']}", username, token, payload, method="PUT")
+            action = "Updated"
+        else:
+            api_request(url, username, token, payload)
+            action = "Added"
+        print(f"{action}: {record_type} {name} {json.dumps(value, ensure_ascii=False)} (TTL {effective_ttl})",
+              file=sys.stderr)
+        return
+
+
+REFLECT_URLS = {
+    "ifconfig.co": "https://ifconfig.co/ip",
+    "ipify.org": "https://api.ipify.org",
+    "cip.cc": "https://www.cip.cc",
+}
+
+
+def get_ip(service="ifconfig.co"):
+    try:
+        result = subprocess.run(
+            ["curl", "-4", "--fail", "--silent", "--show-error",
+             "--max-time", "30", REFLECT_URLS[service]],
+            capture_output=True, text=True, timeout=35, check=False,
+        )
+    except FileNotFoundError:
+        raise Error("curl is required but was not found") from None
+    except (OSError, subprocess.TimeoutExpired):
+        raise Error(f"{service} request failed or timed out") from None
+    if result.returncode:
+        raise Error(f"{service} request failed (curl exit {result.returncode})")
+    value = result.stdout.strip()
+    if service == "cip.cc":
+        match = re.search(r"^IP[ \t]*:[ \t]*(\S+)[ \t]*$", value, re.MULTILINE)
+        value = match.group(1) if match else ""
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ipaddress.AddressValueError:
+        raise Error(f"{service} did not return a valid IPv4 address") from None
+
+
+def parse_interval(value):
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Interval must be a positive integer") from None
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("Interval must be a positive integer")
+    return seconds
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("name", help="Full DNS record name to keep updated")
+    parser.add_argument("--config", default="/etc/namecom.ini", metavar="PATH",
+                        help="INI configuration (default: /etc/namecom.ini)")
+    parser.add_argument("--once", action="store_true", help="Run one iteration and exit")
+    parser.add_argument("--interval", type=parse_interval, default=60, metavar="SECONDS",
+                        help="Wait between iterations, including after errors (default: 60)")
+    parser.add_argument("-R", "--reflect", choices=tuple(REFLECT_URLS), default="ifconfig.co",
+                        help="Public IP reflection service (default: ifconfig.co)")
+    args = parser.parse_args(argv)
+    name = normalize_name(args.name)
+    try:
+        domain, username, token = load_account(args.config, name)
+    except Error as exc:
+        print(f"namecom-ddns: {exc}", file=sys.stderr)
+        return 1
+
+    known_ip = None
+    try:
+        while True:
+            status = 0
+            try:
+                records = None
+                if known_ip is None:
+                    records = get_records(domain, username, token, name, "A", include_id=True)
+                    existing_ips = ", ".join(record["value"] for record in records) or "(none)"
+                    print(f"Existing records: A {name} = {existing_ips}", file=sys.stderr)
+                    if len(records) == 1:
+                        known_ip = records[0]["value"]
+                value = get_ip(args.reflect)
+                if value != known_ip:
+                    if records is not None and not records:
+                        action = "No existing record, creating"
+                    elif records is not None and len(records) > 1:
+                        action = "Multiple records, replacing with one"
+                    else:
+                        action = f"Record differs ({known_ip}), updating"
+                    print(f"{action}: A {name} = {value}", file=sys.stderr)
+                    set_record(domain, username, token, name, "A", value, None, records)
+                    known_ip = value
+                else:
+                    print(f"Record matches, skipped: A {name} = {value}", file=sys.stderr)
+            except Error as exc:
+                print(f"namecom-ddns: {exc}", file=sys.stderr)
+                known_ip = None
+                status = 1
+            if args.once:
+                return status
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

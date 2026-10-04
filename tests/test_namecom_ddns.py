@@ -1,0 +1,98 @@
+import io
+import json
+from pathlib import Path
+import runpy
+import subprocess
+import tempfile
+import unittest
+from contextlib import redirect_stdout, redirect_stderr
+from unittest.mock import patch
+
+DDNS = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'namecom-ddns'))
+
+
+class DDNSTests(unittest.TestCase):
+    def invoke(self, replies, ips, once=True, extra=()):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.ini'
+            config.write_text('[aaa.com]\nusername=user\ntoken=key\n')
+            responses = [r if isinstance(r, Exception) else io.StringIO(json.dumps(r)) for r in replies]
+            curl_results = [subprocess.CompletedProcess([], 0, ip, '') for ip in ips]
+            out, err = io.StringIO(), io.StringIO()
+            with patch('urllib.request.urlopen', side_effect=responses) as api, \
+                    patch('subprocess.run', side_effect=curl_results) as curl, \
+                    patch('time.sleep', side_effect=[None] * (len(ips)-1) + [KeyboardInterrupt()]) as sleep, \
+                    redirect_stdout(out), redirect_stderr(err):
+                args = ['--config', str(config), 'x.aaa.com'] + (['--once'] if once else [])
+                code = DDNS['main'](args + list(extra))
+            return code, out.getvalue(), err.getvalue(), api, curl, sleep
+
+    @staticmethod
+    def record(i=1, value='1.2.3.4'):
+        return dict(id=i, host='x', type='A', answer=value, ttl=600)
+
+    def test_create_and_update(self):
+        for initial, method, ttl in [({}, 'POST', 300), ({'records': [self.record()]}, 'PUT', 600)]:
+            code, out, err, api, curl, sleep = self.invoke([initial, {}], ['5.6.7.8'])
+            self.assertEqual((code, out), (0, ''))
+            request = api.call_args.args[0]
+            self.assertEqual(request.get_method(), method)
+            self.assertEqual(json.loads(request.data), dict(host='x', type='A', answer='5.6.7.8', ttl=ttl))
+            self.assertIn('-4', curl.call_args.args[0])
+            self.assertIn('https://ifconfig.co/ip', curl.call_args.args[0])
+            sleep.assert_not_called()
+
+    def test_duplicates_removed_even_if_first_matches(self):
+        record = self.record()
+        code, _, _, api, _, _ = self.invoke([
+            {'records': [record, self.record(2)]}, {}, {'records': [record]},
+        ], ['1.2.3.4'])
+        self.assertEqual(code, 0)
+        self.assertEqual([c.args[0].get_method() for c in api.call_args_list], ['GET', 'DELETE', 'GET'])
+
+    def test_loop_caches_success_and_sleeps(self):
+        code, _, _, api, curl, sleep = self.invoke([
+            {'records': [self.record()]}, {'records': [self.record()]}, {},
+        ], ['1.2.3.4', '5.6.7.8', '5.6.7.8'], once=False)
+        self.assertEqual(code, 130)
+        self.assertEqual(api.call_count, 3)
+        self.assertEqual(curl.call_count, 3)
+        self.assertEqual([c.args for c in sleep.call_args_list], [(60,), (60,), (60,)])
+
+    def test_failed_update_requeries_next_iteration(self):
+        code, _, err, api, _, _ = self.invoke([
+            {}, TimeoutError(), {}, {},
+        ], ['1.2.3.4', '1.2.3.4'], once=False)
+        self.assertEqual(code, 130)
+        self.assertIn('namecom-ddns:', err)
+        self.assertEqual([c.args[0].get_method() for c in api.call_args_list], ['GET', 'POST', 'GET', 'POST'])
+
+    def test_reflection_services(self):
+        for option in ('-R', '--reflect'):
+            for service, body, url in [
+                ('ifconfig.co', '5.6.7.8\n', 'https://ifconfig.co/ip'),
+                ('ipify.org', '5.6.7.8', 'https://api.ipify.org'),
+                ('cip.cc', 'IP\t: 5.6.7.8\n地址\t: test\nURL\t: http://www.cip.cc/5.6.7.8\n', 'https://www.cip.cc'),
+            ]:
+                code, _, _, api, curl, _ = self.invoke([{}, {}], [body], extra=[option, service])
+                self.assertEqual(code, 0)
+                self.assertEqual(curl.call_args.args[0][-1], url)
+                self.assertEqual(json.loads(api.call_args.args[0].data)['answer'], '5.6.7.8')
+
+    def test_invalid_cip_response_does_not_write(self):
+        for body in ['URL: http://www.cip.cc/1.2.3.4', 'IP : ::1', '<html>1.2.3.4</html>']:
+            code, _, err, api, _, _ = self.invoke([{}], [body], extra=['-R', 'cip.cc'])
+            self.assertEqual(code, 1)
+            self.assertIn('cip.cc did not return a valid IPv4', err)
+            api.assert_called_once()
+
+    def test_invalid_reflection_does_not_write(self):
+        for ip in ['::1', '<html>error</html>', '']:
+            code, out, err, api, _, _ = self.invoke([{}], [ip])
+            self.assertEqual((code, out), (1, ''))
+            self.assertIn('valid IPv4', err)
+            api.assert_called_once()
+
+
+if __name__ == '__main__':
+    unittest.main()
