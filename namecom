@@ -22,7 +22,7 @@ def normalize_name(name):
     return name.rstrip(".").lower()
 
 
-def load_account(path, name):
+def load_config(path):
     config = configparser.ConfigParser(interpolation=None)
     try:
         with open(path, encoding="utf-8") as stream:
@@ -33,6 +33,11 @@ def load_account(path, name):
         # ConfigParser errors can contain source lines, including credentials.
         raise Error(f"Invalid INI configuration: {path}") from None
 
+    return config
+
+
+def load_account(path, name):
+    config = load_config(path)
     matches = [
         (normalize_name(section), section) for section in config.sections()
         if normalize_name(section)
@@ -73,7 +78,7 @@ def api_request(url, username, token, payload=None, method=None):
         raise Error("Name.com API returned invalid JSON") from None
 
 
-def get_records(domain, username, token, name, record_type, include_id=False):
+def get_records(domain, username, token, name=None, record_type=None, include_id=False):
     result = []
     page = 1
     while True:
@@ -87,13 +92,15 @@ def get_records(domain, username, token, name, record_type, include_id=False):
                 fqdn = record.get("fqdn") or (
                     domain if host in ("", "@") else f"{host}.{domain}"
                 )
-                if (normalize_name(fqdn) == name
-                        and record["type"].upper() == record_type):
+                if ((name is None or normalize_name(fqdn) == name)
+                        and (record_type is None or record["type"].upper() == record_type)):
                     value = record["answer"]
                     if not isinstance(value, str):
                         raise ValueError
-                    result.append({"name": name, "type": record_type,
+                    result.append({"name": normalize_name(fqdn), "type": record["type"].upper(),
                                    "value": value, "ttl": record["ttl"]})
+                    if name is None and "priority" in record:
+                        result[-1]["priority"] = record["priority"]
                     if include_id:
                         record_id = record["id"]
                         if type(record_id) is not int or record_id <= 0:
@@ -180,6 +187,12 @@ def main(argv=None):
     add = commands.add_parser("add", help="Add a record without checking for duplicates")
     delete = commands.add_parser("del", help="Delete all records matching name and type")
     set_command = commands.add_parser("set", help="Replace matching records with a single record")
+    list_command = commands.add_parser("list", help="List all records in a configured domain zone")
+    list_command.add_argument("name", nargs="?", metavar="DOMAIN",
+                              help="Configured zone (default: all configured zones)")
+    list_command.add_argument("--json", action="store_true", help="Print record objects as JSON")
+    list_command.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
+                              help="INI configuration (default: /etc/namecom.ini)")
     for command in (get, add, delete, set_command):
         command.add_argument("type", type=str.upper, choices=("A", "AAAA", "CNAME", "TXT"))
         command.add_argument("name", help="Full record name, including the domain")
@@ -193,9 +206,20 @@ def main(argv=None):
     set_command.add_argument("--ttl", type=parse_ttl, metavar="SECONDS",
                      help="Time to live (default: preserve existing TTL, or 300 for a new record)")
     args = parser.parse_args(argv)
-    name = normalize_name(args.name)
+    name = normalize_name(args.name) if args.name is not None else None
     try:
-        domain, username, token = load_account(args.config, name)
+        if args.command == "list":
+            zones = [name] if name is not None else list(dict.fromkeys(
+                normalize_name(section) for section in load_config(args.config).sections()
+            ))
+            records = []
+            for zone in zones:
+                domain, username, token = load_account(args.config, zone)
+                if zone != domain:
+                    raise Error(f"Use the configured zone name: {domain}")
+                records.extend(get_records(domain, username, token, include_id=True))
+        else:
+            domain, username, token = load_account(args.config, name)
         if args.command == "add":
             add_record(domain, username, token, name, args.type, args.value, args.ttl)
             return 0
@@ -205,12 +229,18 @@ def main(argv=None):
         if args.command == "set":
             set_record(domain, username, token, name, args.type, args.value, args.ttl)
             return 0
-        records = get_records(domain, username, token, name, args.type)
+        if args.command == "get":
+            records = get_records(domain, username, token, name, args.type)
     except Error as exc:
         print(f"namecom: {exc}", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(records, ensure_ascii=False, indent=2))
+    elif args.command == "list":
+        for record in records:
+            priority = f" priority={record['priority']}" if "priority" in record else ""
+            print(f"{record['name']}\t{record['type']}\t"
+                  f"{json.dumps(record['value'], ensure_ascii=False)}\tTTL={record['ttl']}{priority}")
     else:
         for record in records:
             print(record["value"])
