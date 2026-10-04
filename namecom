@@ -49,7 +49,7 @@ def load_account(path, name):
     return domain, username, token
 
 
-def api_request(url, username, token, payload=None):
+def api_request(url, username, token, payload=None, method=None):
     authorization = base64.b64encode(
         f"{username}:{token}".encode("utf-8")
     ).decode("ascii")
@@ -59,9 +59,11 @@ def api_request(url, username, token, payload=None):
     if payload is not None:
         body = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=body, headers=headers)
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
+            if method == "DELETE":
+                return None
             return json.load(response)
     except urllib.error.HTTPError as exc:
         raise Error(f"Name.com API returned HTTP {exc.code}") from None
@@ -71,7 +73,7 @@ def api_request(url, username, token, payload=None):
         raise Error("Name.com API returned invalid JSON") from None
 
 
-def get_records(domain, username, token, name, record_type):
+def get_records(domain, username, token, name, record_type, include_id=False):
     result = []
     page = 1
     while True:
@@ -92,6 +94,11 @@ def get_records(domain, username, token, name, record_type):
                         raise ValueError
                     result.append({"name": name, "type": record_type,
                                    "value": value, "ttl": record["ttl"]})
+                    if include_id:
+                        record_id = record["id"]
+                        if type(record_id) is not int or record_id <= 0:
+                            raise ValueError
+                        result[-1]["id"] = record_id
             next_page = data.get("nextPage")
             if not next_page:
                 return result
@@ -113,6 +120,15 @@ def add_record(domain, username, token, name, record_type, value, ttl):
     })
 
 
+def delete_records(domain, username, token, name, record_type):
+    # Finish pagination before deleting so records cannot shift between pages.
+    records = get_records(domain, username, token, name, record_type, include_id=True)
+    for record in records:
+        url = (f"{API_URL}/domains/{urllib.parse.quote(domain, safe='')}/records/"
+               f"{record['id']}")
+        api_request(url, username, token, method="DELETE")
+
+
 def parse_ttl(value):
     try:
         ttl = int(value)
@@ -130,7 +146,8 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     get = commands.add_parser("get", help="Print matching DNS record values")
     add = commands.add_parser("add", help="Add a record unless the same value exists")
-    for command in (get, add):
+    delete = commands.add_parser("del", help="Delete all records matching name and type")
+    for command in (get, add, delete):
         command.add_argument("type", type=str.upper, choices=("A", "AAAA", "CNAME", "TXT"))
         command.add_argument("name", help="Full record name, including the domain")
         command.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH",
@@ -145,6 +162,9 @@ def main(argv=None):
         domain, username, token = load_account(args.config, name)
         if args.command == "add":
             add_record(domain, username, token, name, args.type, args.value, args.ttl)
+            return 0
+        if args.command == "del":
+            delete_records(domain, username, token, name, args.type)
             return 0
         records = get_records(domain, username, token, name, args.type)
     except Error as exc:
